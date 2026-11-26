@@ -90,7 +90,7 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       player.stop();
       emit(const AudioState());
     });
-    on<AudioSeekToNext>((event, emit) => player.seekToNext());
+    on<AudioSeekToNext>(_onSeekToNext);
     on<AudioSeekToPrevious>(_onSeekToPrevious);
     on<AudioJumpToQueueIndex>(_onJumpToQueueIndex);
 
@@ -280,18 +280,37 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     }
   }
 
+  Future<void> _onSeekToNext(
+    AudioSeekToNext event,
+    Emitter<AudioState> emit,
+  ) async {
+    if (player.hasNext) {
+      await player.seekToNext();
+      return;
+    }
+    final currNative = player.currentIndex ?? 0;
+    final nextQueueIndex = state.nativeIndexOffset + currNative + 1;
+    var activeQueue = state.queue;
+    if (nextQueueIndex >= activeQueue.length) {
+      activeQueue = await _checkAndLoadRadio(baseQueue: activeQueue);
+    }
+    if (nextQueueIndex < activeQueue.length && !isClosed) {
+      add(AudioPlayQueue(activeQueue, startIndex: nextQueueIndex));
+    }
+  }
+
   Future<void> _onSeekToPrevious(
     AudioSeekToPrevious event,
     Emitter<AudioState> emit,
   ) async {
     if (player.hasPrevious) {
-      player.seekToPrevious();
-    } else {
-      if (state.nativeIndexOffset > 0) {
-        add(
-          AudioPlayQueue(state.queue, startIndex: state.nativeIndexOffset - 1),
-        );
-      }
+      await player.seekToPrevious();
+    } else if (state.nativeIndexOffset > 0) {
+      add(
+        AudioPlayQueue(state.queue, startIndex: state.nativeIndexOffset - 1),
+      );
+    } else if (player.position > const Duration(seconds: 2)) {
+      await player.seek(Duration.zero);
     }
   }
 
