@@ -1,7 +1,10 @@
 package com.ember.app
 
 import android.content.Context
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -9,6 +12,50 @@ import com.ryanheise.audioservice.AudioServicePlugin
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import java.util.concurrent.Executors
+
+private object PlaybackLockManager {
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    @Synchronized
+    fun setEnabled(context: Context, enabled: Boolean) {
+        val appCtx = context.applicationContext
+        if (enabled) {
+            if (wakeLock == null) {
+                val pm = appCtx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Ember::PlaybackWakeLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire()
+            }
+
+            if (wifiLock == null) {
+                val wm = appCtx.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wm?.createWifiLock(mode, "Ember::PlaybackWifiLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wifiLock?.isHeld == false) {
+                wifiLock?.acquire()
+            }
+        } else {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+            }
+        }
+    }
+}
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "com.example.ember/python"
@@ -25,10 +72,28 @@ class MainActivity: FlutterActivity() {
         }
     }
 
+    override fun onDestroy() {
+        if (isFinishing) {
+            PlaybackLockManager.setEnabled(this, false)
+        }
+        super.onDestroy()
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+            if (call.method == "set_playback_wakelock") {
+                val enabled = call.argument<Boolean>("enabled") ?: false
+                try {
+                    PlaybackLockManager.setEnabled(this, enabled)
+                    result.success(true)
+                } catch (e: Exception) {
+                    result.error("WAKELOCK_ERROR", e.message, null)
+                }
+                return@setMethodCallHandler
+            }
+
             val py = Python.getInstance()
             val module = py.getModule("android_api")
             

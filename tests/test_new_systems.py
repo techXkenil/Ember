@@ -106,3 +106,37 @@ def test_stream_resolver_quality_mode_and_disk_cache() -> None:
         assert url is not None
         assert url.startswith("file:")
         assert "cached_song" in url
+
+
+def test_stream_resolver_fallback_client_on_empty_primary():
+    from ember.stream import FALLBACK_EXTRACTOR_ARGS, StreamResolver
+
+    resolver = StreamResolver()
+    calls = []
+
+    def fake_probe(target, max_attempts=3, options_override=None):
+        calls.append(options_override)
+        if options_override is None:
+            return {"formats": []}
+        return {
+            "formats": [
+                {
+                    "format_id": "140",
+                    "ext": "m4a",
+                    "acodec": "mp4a.40.2",
+                    "vcodec": "none",
+                    "protocol": "https",
+                    "abr": 128,
+                    "url": "https://example.com/audio.m4a",
+                }
+            ]
+        }
+
+    resolver._probe = fake_probe
+    url, msg, perm = resolver.resolve("abc123")
+    assert url == "https://example.com/audio.m4a"
+    assert msg == ""
+    assert perm is False
+    assert len(calls) == 2
+    assert calls[0] is None
+    assert calls[1] == {"extractor_args": FALLBACK_EXTRACTOR_ARGS}

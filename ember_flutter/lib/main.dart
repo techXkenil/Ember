@@ -32,7 +32,7 @@ void main() async {
   await JustAudioBackground.init(
     androidNotificationChannelId: 'com.example.ember.channel.audio',
     androidNotificationChannelName: 'Ember Music',
-    androidNotificationOngoing: false,
+    androidNotificationOngoing: true,
     androidStopForegroundOnPause: false,
     androidShowNotificationBadge: true,
     androidNotificationIcon: 'drawable/ic_music_notification',
@@ -122,17 +122,31 @@ class MainLayout extends StatefulWidget {
 class _MainLayoutState extends State<MainLayout> {
   int _currentIndex = 0;
 
+  Future<void> _requestBackgroundPlaybackPermissions() async {
+    try {
+      final notifStatus = await Permission.notification.status;
+      if (notifStatus.isDenied) {
+        await Permission.notification.request();
+      }
+      final prompted =
+          await DatabaseService.instance.getCache('battery_opt_prompted');
+      if (prompted == null) {
+        await DatabaseService.instance.setCache('battery_opt_prompted', 'true');
+        final batteryStatus = await Permission.ignoreBatteryOptimizations.status;
+        if (!batteryStatus.isGranted) {
+          await Permission.ignoreBatteryOptimizations.request();
+        }
+      }
+    } catch (_) {}
+  }
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       UpdateChecker.checkForUpdate(context);
       if (Platform.isAndroid) {
-        Permission.notification.status.then((status) {
-          if (status.isDenied) {
-            Permission.notification.request();
-          }
-        });
+        _requestBackgroundPlaybackPermissions();
       }
     });
 
