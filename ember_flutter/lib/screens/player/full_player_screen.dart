@@ -443,10 +443,13 @@ class _FullPlayerScreenState extends State<FullPlayerScreen> {
 
             if (track != null && _lastLyricsVideoId != videoId) {
               _lastLyricsVideoId = videoId;
+              _lastActiveIndex = -1;
+              _lyricKeys.clear();
               _lyricsFuture = PythonService.lyrics(
                 videoId ?? '',
                 title: track['title'] ?? '',
                 artist: track['artist'] ?? '',
+                duration: track['duration'] ?? '',
               );
             }
 
@@ -733,99 +736,134 @@ class _FullPlayerScreenState extends State<FullPlayerScreen> {
 
               final result = snapshot.data;
               if (result is Success<String>) {
-                final lrcRegex = RegExp(r'\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)');
-                final rawLines = result.data.split('\n').where((l) => l.trim().isNotEmpty).toList();
-                final List<Map<String, dynamic>> parsedLines = [];
-                bool hasTimestamps = false;
+                final tagRegex = RegExp(r'\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]');
+                final metaRegex = RegExp(r'^\[(ti|ar|al|by|length|re|ve|offset):(.*)\]$', caseSensitive: false);
+                final inlineWordTagRegex = RegExp(r'<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>');
+                final rawLines = result.data.split(RegExp(r'\r?\n'));
+                final List<Map<String, dynamic>> timedLines = [];
+                final List<Map<String, dynamic>> plainLines = [];
+                int offsetMs = 0;
 
-                for (final line in rawLines) {
-                  final match = lrcRegex.firstMatch(line);
-                  if (match != null) {
-                    hasTimestamps = true;
-                    final min = int.parse(match.group(1)!);
-                    final sec = int.parse(match.group(2)!);
-                    final msData = match.group(3)!;
-                    final ms = msData.length == 2 ? int.parse(msData) * 10 : int.parse(msData);
-                    final duration = Duration(
-                      minutes: min,
-                      seconds: sec,
-                      milliseconds: ms,
-                    );
-                    final text = match.group(4)!.trim();
-                    parsedLines.add({'time': duration, 'text': text});
+                for (final rawLine in rawLines) {
+                  final trimmed = rawLine.trim();
+                  if (trimmed.isEmpty) continue;
+
+                  final metaMatch = metaRegex.firstMatch(trimmed);
+                  if (metaMatch != null) {
+                    if (metaMatch.group(1)!.toLowerCase() == 'offset') {
+                      offsetMs = int.tryParse(metaMatch.group(2)!.trim()) ?? 0;
+                    }
+                    continue;
+                  }
+
+                  final matches = tagRegex.allMatches(trimmed).toList();
+                  if (matches.isNotEmpty) {
+                    final text = trimmed
+                        .replaceAll(tagRegex, '')
+                        .replaceAll(inlineWordTagRegex, '')
+                        .trim();
+                    for (final match in matches) {
+                      final min = int.parse(match.group(1)!);
+                      final sec = int.parse(match.group(2)!);
+                      final frac = match.group(3);
+                      int ms = 0;
+                      if (frac != null) {
+                        ms = frac.length == 1
+                            ? int.parse(frac) * 100
+                            : (frac.length == 2 ? int.parse(frac) * 10 : int.parse(frac));
+                      }
+                      final totalMs = (min * 60 + sec) * 1000 + ms - offsetMs;
+                      timedLines.add({
+                        'time': Duration(milliseconds: totalMs < 0 ? 0 : totalMs),
+                        'text': text,
+                      });
+                    }
                   } else {
-                    parsedLines.add({'time': null, 'text': line.trim()});
+                    plainLines.add({'time': null, 'text': trimmed});
                   }
                 }
+
+                final bool hasTimestamps = timedLines.isNotEmpty;
+                if (hasTimestamps) {
+                  timedLines.sort(
+                    (a, b) => (a['time'] as Duration).compareTo(b['time'] as Duration),
+                  );
+                }
+                final parsedLines = hasTimestamps ? timedLines : plainLines;
 
                 return StreamBuilder<Duration>(
                   stream: audioBloc.player.positionStream,
                   builder: (context, posSnap) {
-                    return StreamBuilder<Duration?>(
-                      stream: audioBloc.player.durationStream,
-                      builder: (context, durSnap) {
-                        final pos = posSnap.data ?? Duration.zero;
+                    final pos = posSnap.data ?? Duration.zero;
 
-                        int activeIndex = -1;
-                        if (hasTimestamps) {
-                          for (int i = 0; i < parsedLines.length; i++) {
-                            if (parsedLines[i]['time'] != null && pos >= (parsedLines[i]['time'] as Duration)) {
-                              activeIndex = i;
-                            }
-                          }
+                    int activeIndex = -1;
+                    if (hasTimestamps) {
+                      for (int i = 0; i < parsedLines.length; i++) {
+                        final lineTime = parsedLines[i]['time'] as Duration?;
+                        if (lineTime != null && pos >= lineTime) {
+                          activeIndex = i;
+                        }
+                      }
+                    }
+
+                    if (activeIndex != -1 &&
+                        activeIndex != _lastActiveIndex &&
+                        _sheetController.isAttached &&
+                        _sheetController.size > 0.25) {
+                      _lastActiveIndex = activeIndex;
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (!mounted) return;
+                        final key = _lyricKeys[activeIndex];
+                        if (key != null && key.currentContext != null) {
+                          Scrollable.ensureVisible(
+                            key.currentContext!,
+                            duration: const Duration(milliseconds: 300),
+                            curve: Curves.easeOut,
+                            alignment: 0.4,
+                          );
+                        }
+                      });
+                    }
+
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: parsedLines.asMap().entries.map((entry) {
+                        final idx = entry.key;
+                        final item = entry.value;
+                        final key = _lyricKeys.putIfAbsent(idx, () => GlobalKey());
+
+                        // If synced, use activeIndex. If unsynced, show all lyrics uniformly
+                        final isActive = hasTimestamps ? (idx == activeIndex) : true;
+                        final lineTime = item['time'] as Duration?;
+                        final text = item['text'] as String;
+                        if (text.isEmpty) {
+                          return SizedBox(key: key, height: 16);
                         }
 
-                        if (activeIndex != -1 && activeIndex != _lastActiveIndex) {
-                          _lastActiveIndex = activeIndex;
-                          if (_sheetController.isAttached && _sheetController.size > 0.5) {
-                            WidgetsBinding.instance.addPostFrameCallback((_) {
-                              final key = _lyricKeys[activeIndex];
-                              if (key != null && key.currentContext != null) {
-                                Scrollable.ensureVisible(
-                                  key.currentContext!,
-                                  duration: const Duration(milliseconds: 300),
-                                  curve: Curves.easeOut,
-                                  alignment: 0.5,
-                                );
-                              }
-                            });
-                          }
-                        }
-
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: parsedLines.asMap().entries.map((entry) {
-                            final idx = entry.key;
-                            final item = entry.value;
-                            final key = _lyricKeys.putIfAbsent(idx, () => GlobalKey());
-
-                            // If synced, use activeIndex. If unsynced, show all lyrics uniformly
-                            final isActive = hasTimestamps ? (idx == activeIndex) : true;
-
-                            final text = item['text'] as String;
-                            if (text.isEmpty) {
-                              return SizedBox(key: key, height: 16);
-                            }
-
-                            return Container(
-                              key: key,
-                              padding: const EdgeInsets.symmetric(
-                                vertical: 6.0,
+                        return GestureDetector(
+                          key: key,
+                          behavior: HitTestBehavior.opaque,
+                          onTap: lineTime != null
+                              ? () => audioBloc.player.seek(lineTime)
+                              : null,
+                          child: Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.symmetric(
+                              vertical: 6.0,
+                            ),
+                            child: AnimatedDefaultTextStyle(
+                              duration: const Duration(milliseconds: 250),
+                              style: TextStyle(
+                                color: (hasTimestamps ? (isActive ? Colors.white : Colors.white38) : Colors.white70),
+                                fontSize: isActive ? (hasTimestamps ? 22 : 18) : 17,
+                                height: 1.4,
+                                fontWeight: isActive ? FontWeight.bold : FontWeight.w500,
                               ),
-                              child: AnimatedDefaultTextStyle(
-                                duration: const Duration(milliseconds: 250),
-                                style: TextStyle(
-                                  color: (hasTimestamps ? (isActive ? Colors.white : Colors.white38) : Colors.white70),
-                                  fontSize: isActive ? (hasTimestamps ? 22 : 18) : 17,
-                                  height: 1.4,
-                                  fontWeight: isActive ? FontWeight.bold : FontWeight.w500,
-                                ),
-                                child: Text(text),
-                              ),
-                            );
-                          }).toList(),
+                              child: Text(text),
+                            ),
+                          ),
                         );
-                      },
+                      }).toList(),
                     );
                   },
                 );

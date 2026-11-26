@@ -171,55 +171,191 @@ class CatalogSource:
         log.debug("radio for %s -> %d track(s)", seed_id, len(related))
         return related
 
-    def lyrics(self, video_id: str, title: str = "", artist: str = "") -> Optional[str]:
-        """Fetch lyrics text, preferring LRCLIB timed .lrc, fallback to YouTube Music for plain text."""
-        video_id = (video_id or "").strip()
-        title = (title or "").strip()
-        artist = (artist or "").strip()
-        
-        # 1. Try LRCLIB for pristine timestamped lyrics
-        if title and artist:
+    def lyrics(
+        self,
+        video_id: str,
+        title: str = "",
+        artist: str = "",
+        duration: str = "",
+    ) -> Optional[str]:
+        """Fetch lyrics text, preferring synced timestamps from LRCLIB or YouTube Music."""
+        import json
+        import re
+        import urllib.parse
+        import urllib.request
+
+        try:
+            from ember.lyrics import clean_title
+        except ImportError:
             try:
-                import urllib.request, urllib.parse, json
-                url = f"https://lrclib.net/api/search?track_name={urllib.parse.quote(title)}&artist_name={urllib.parse.quote(artist)}"
-                req = urllib.request.Request(url, headers={'User-Agent': 'EmberMusic/1.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = json.loads(response.read().decode())
-                    if isinstance(data, list) and len(data) > 0:
-                        for entry in data:
-                            if entry.get("syncedLyrics"):
-                                return str(entry["syncedLyrics"])
-                        # If no synced LRC exists, keep fallback
-                        for entry in data:
-                            if entry.get("plainLyrics"):
-                                return str(entry["plainLyrics"])
-            except Exception as exc:
-                log.warning("lrclib fetch failed for %s - %s: %s", title, artist, exc)
-                
-        # 2. Fallback to YouTube Music
-        if not video_id:
+                from lyrics import clean_title
+            except ImportError:
+                def clean_title(value: str) -> str:
+                    return value.strip()
+
+        video_id = (video_id or "").strip()
+        raw_title = (title or "").strip()
+        raw_artist = (artist or "").strip()
+        raw_duration = (duration or "").strip()
+
+        def _parse_duration_sec(val: str) -> Optional[int]:
+            if not val:
+                return None
+            if val.isdigit():
+                return int(val)
+            parts = val.split(":")
+            try:
+                nums = [int(p) for p in parts]
+            except ValueError:
+                return None
+            if len(nums) == 2:
+                return nums[0] * 60 + nums[1]
+            if len(nums) == 3:
+                return nums[0] * 3600 + nums[1] * 60 + nums[2]
             return None
+
+        def _normalize_artist(val: str) -> str:
+            cleaned = re.sub(r"\s*-\s*Topic$", "", val, flags=re.IGNORECASE).strip()
+            if cleaned.lower() in {"", "unknown", "unknown artist", "various artists"}:
+                return ""
+            return cleaned
+
+        def _format_lrc_time(ms: int) -> str:
+            ms = max(0, ms)
+            minutes = ms // 60000
+            seconds = (ms % 60000) // 1000
+            centis = (ms % 1000) // 10
+            return f"[{minutes:02d}:{seconds:02d}.{centis:02d}]"
+
+        def _fetch_json(url: str) -> object:
+            req = urllib.request.Request(url, headers={"User-Agent": "EmberMusic/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        def _pick_lrclib(entries: list, target_sec: Optional[int]) -> tuple[Optional[str], Optional[str]]:
+            best_synced: Optional[str] = None
+            best_synced_diff = float("inf")
+            best_plain: Optional[str] = None
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_dur = entry.get("duration")
+                diff = abs(float(entry_dur) - target_sec) if (target_sec and isinstance(entry_dur, (int, float))) else 0.0
+                synced = (entry.get("syncedLyrics") or "").strip()
+                plain = (entry.get("plainLyrics") or "").strip()
+                if synced:
+                    if target_sec and isinstance(entry_dur, (int, float)) and diff > 15:
+                        pass
+                    elif diff < best_synced_diff:
+                        best_synced = synced
+                        best_synced_diff = diff
+                if plain and best_plain is None:
+                    best_plain = plain
+            return best_synced, best_plain
+
+        duration_sec = _parse_duration_sec(raw_duration)
+        cleaned_title = clean_title(raw_title) if raw_title else ""
+        cleaned_artist = _normalize_artist(raw_artist)
+        primary_artist = re.split(r"\s*(?:,|&|\bfeat\.?|\bft\.?)\s*", cleaned_artist, maxsplit=1, flags=re.IGNORECASE)[0].strip() if cleaned_artist else ""
+
+        lrclib_plain_fallback: Optional[str] = None
+
+        # 1. Try LRCLIB exact /get when duration is known, then /search queries.
+        if cleaned_title and cleaned_artist:
+            if duration_sec:
+                try:
+                    get_url = (
+                        "https://lrclib.net/api/get"
+                        f"?track_name={urllib.parse.quote(cleaned_title)}"
+                        f"&artist_name={urllib.parse.quote(cleaned_artist)}"
+                        f"&duration={duration_sec}"
+                    )
+                    exact = _fetch_json(get_url)
+                    if isinstance(exact, dict):
+                        synced = (exact.get("syncedLyrics") or "").strip()
+                        if synced:
+                            return synced
+                        plain = (exact.get("plainLyrics") or "").strip()
+                        if plain:
+                            lrclib_plain_fallback = plain
+                except Exception:
+                    pass
+
+            queries: list[tuple[str, str]] = [(cleaned_title, cleaned_artist)]
+            if primary_artist and primary_artist != cleaned_artist:
+                queries.append((cleaned_title, primary_artist))
+            if raw_title and raw_title != cleaned_title:
+                queries.append((raw_title, primary_artist or cleaned_artist))
+
+            for q_title, q_artist in queries:
+                try:
+                    search_url = (
+                        "https://lrclib.net/api/search"
+                        f"?track_name={urllib.parse.quote(q_title)}"
+                        f"&artist_name={urllib.parse.quote(q_artist)}"
+                    )
+                    data = _fetch_json(search_url)
+                    if isinstance(data, list) and data:
+                        synced, plain = _pick_lrclib(data, duration_sec)
+                        if synced:
+                            return synced
+                        if plain and lrclib_plain_fallback is None:
+                            lrclib_plain_fallback = plain
+                except Exception as exc:
+                    log.warning("lrclib fetch failed for %s - %s: %s", q_title, q_artist, exc)
+
+        # 2. Fallback to YouTube Music (prefer timed lines if available)
+        if not video_id:
+            return lrclib_plain_fallback
 
         def _do_lyrics() -> Optional[str]:
             watch = self.api.get_watch_playlist(videoId=video_id)
             lyrics_id = watch.get("lyrics")
             if not lyrics_id:
                 return None
-            data = self.api.get_lyrics(lyrics_id)
+            try:
+                data = self.api.get_lyrics(lyrics_id, timestamps=True)
+            except TypeError:
+                data = self.api.get_lyrics(lyrics_id)
             if not data or not isinstance(data, dict):
                 return None
-            return str(data.get("lyrics", "")).strip() or None
+            if data.get("hasTimestamps") and isinstance(data.get("lyrics"), list):
+                lrc_lines: list[str] = []
+                for item in data["lyrics"]:
+                    if isinstance(item, dict):
+                        text = str(item.get("text", "")).strip()
+                        start_ms = item.get("start_time") or item.get("startTimeMs")
+                    else:
+                        text = str(getattr(item, "text", "")).strip()
+                        start_ms = getattr(item, "start_time", None)
+                    if text and start_ms is not None:
+                        lrc_lines.append(f"{_format_lrc_time(int(start_ms))} {text}")
+                if lrc_lines:
+                    return "\n".join(lrc_lines)
+            raw = data.get("lyrics")
+            if isinstance(raw, str):
+                return raw.strip() or None
+            if isinstance(raw, list):
+                joined = "\n".join(
+                    str(item.get("text", "") if isinstance(item, dict) else getattr(item, "text", "")).strip()
+                    for item in raw
+                ).strip()
+                return joined or None
+            return None
 
         try:
-            return _with_retry(
+            yt_lyrics = _with_retry(
                 _do_lyrics,
                 max_attempts=2,
                 base_delay=0.5,
                 operation_name=f"lyrics({video_id})",
             )
-        except Exception as exc: 
+            if yt_lyrics:
+                return yt_lyrics
+        except Exception as exc:
             log.warning("lyrics lookup failed for %s: %s", video_id, exc)
-            return None
+
+        return lrclib_plain_fallback
 
     def home(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Fetch the dynamic YTMusic home feed and filter for playable tracks."""

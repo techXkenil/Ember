@@ -175,12 +175,14 @@ class PythonService {
     String videoId, {
     String title = "",
     String artist = "",
+    String duration = "",
   }) async {
     try {
       final res = await _channel.invokeMethod('lyrics', {
         'videoId': videoId,
         'title': title,
         'artist': artist,
+        'duration': duration,
       });
       if (res == null || res.toString().trim().isEmpty) {
         return const Failure("No lyrics found.");

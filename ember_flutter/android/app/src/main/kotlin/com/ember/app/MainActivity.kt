@@ -82,10 +82,13 @@ class MainActivity: FlutterActivity() {
                     }
                 }
                 "lyrics" -> {
-                    val videoId = call.argument<String>("videoId")
+                    val videoId = call.argument<String>("videoId") ?: ""
+                    val title = call.argument<String>("title") ?: ""
+                    val artist = call.argument<String>("artist") ?: ""
+                    val duration = call.argument<String>("duration") ?: ""
                     executor.execute {
                         try {
-                            val res = module.callAttr("lyrics", videoId)?.toString()
+                            val res = module.callAttr("lyrics", videoId, title, artist, duration)?.toString()
                             runOnUiThread { result.success(res) }
                         } catch (e: Exception) {
                             runOnUiThread { result.error("PYTHON_ERROR", e.message, null) }

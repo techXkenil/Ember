@@ -171,13 +171,18 @@ def get_home(*args: Any, **kwargs: Any) -> str:
         return "[]"
 
 
-def lyrics(video_id: str, title: str = "", artist: str = "") -> str:
+def lyrics(video_id: str, title: str = "", artist: str = "", duration: str = "") -> str:
     """Fetch track lyrics."""
-    if not video_id:
+    if not video_id and not (title and artist):
         return ""
     try:
         cat = _get_catalog()
-        res = cat.lyrics(video_id.strip())
+        res = cat.lyrics(
+            (video_id or "").strip(),
+            title=(title or "").strip(),
+            artist=(artist or "").strip(),
+            duration=(duration or "").strip(),
+        )
         return str(res or "")
     except Exception as exc:
         log.error("lyrics failed for %r: %s", video_id, exc)
