@@ -1,5 +1,6 @@
 import 'dart:ui';
 
+import 'package:audio_session/audio_session.dart';
 import 'package:ember_flutter/blocs/audio/audio_bloc.dart';
 import 'package:ember_flutter/blocs/audio/audio_state.dart';
 import 'package:ember_flutter/blocs/storage/storage_bloc.dart';
@@ -34,6 +35,12 @@ void main() async {
     androidShowNotificationBadge: true,
     androidNotificationIcon: 'drawable/ic_music_notification',
   );
+
+  // Configure the global audio session for music playback before creating AudioPlayer
+  // so Android audio attributes (USAGE_MEDIA / CONTENT_TYPE_MUSIC) are ready
+  // immediately for Bluetooth and wired earbuds routing.
+  final audioSession = await AudioSession.instance;
+  await audioSession.configure(const AudioSessionConfiguration.music());
 
   final storageBloc = StorageBloc();
   await storageBloc.init();
@@ -94,7 +101,9 @@ class _EmberAppState extends State<EmberApp> {
           theme: YTTheme.getTheme(currentTheme),
           home: _isLoading
               ? const Scaffold(body: Center(child: CircularProgressIndicator()))
-              : (_needsOnboarding ? const OnboardingScreen() : const MainLayout()),
+              : (_needsOnboarding
+                  ? const OnboardingScreen()
+                  : const MainLayout()),
         );
       },
     );
@@ -144,13 +153,15 @@ class _MainLayoutState extends State<MainLayout> {
 
   @override
   Widget build(BuildContext context) {
-    return BlocBuilder<ThemeCubit, EmberThemeOption>(builder: (context, themeOption) {
+    return BlocBuilder<ThemeCubit, EmberThemeOption>(
+        builder: (context, themeOption) {
       return Scaffold(
         backgroundColor: YTColors.background,
         extendBody: true,
         body: BlocBuilder<AudioBloc, AudioState>(
           builder: (context, audioState) {
-            final topColor = audioState.dominantColor ?? const Color(0xFF6B1B1B);
+            final topColor =
+                audioState.dominantColor ?? const Color(0xFF6B1B1B);
             return Stack(
               children: [
                 if (_currentIndex == 0) // Only on home screen
@@ -176,13 +187,16 @@ class _MainLayoutState extends State<MainLayout> {
                   ),
                 NestedScrollView(
                   physics: const ClampingScrollPhysics(),
-                  headerSliverBuilder: (BuildContext context, bool innerBoxIsScrolled) {
+                  headerSliverBuilder:
+                      (BuildContext context, bool innerBoxIsScrolled) {
                     return [
-                      if (_currentIndex == 0) // Only show top bar on home screen
+                      if (_currentIndex ==
+                          0) // Only show top bar on home screen
                         SliverAppBar(
                           floating: true,
                           snap: true,
-                          backgroundColor: Colors.transparent, // transparent for gradient
+                          backgroundColor:
+                              Colors.transparent, // transparent for gradient
                           surfaceTintColor: Colors.transparent,
                           title: Row(
                             children: [
@@ -194,7 +208,10 @@ class _MainLayoutState extends State<MainLayout> {
                               const SizedBox(width: 8),
                               Text(
                                 'Ember',
-                                style: Theme.of(context).textTheme.displayMedium?.copyWith(
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .displayMedium
+                                    ?.copyWith(
                                       fontWeight: FontWeight.bold,
                                       letterSpacing: 1.2,
                                     ),

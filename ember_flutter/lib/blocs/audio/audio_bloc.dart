@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:audio_session/audio_session.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:just_audio/just_audio.dart';
@@ -14,7 +15,7 @@ import 'package:ember_flutter/blocs/audio/audio_event.dart';
 import 'package:ember_flutter/blocs/audio/audio_state.dart';
 
 class AudioBloc extends Bloc<AudioEvent, AudioState> {
-  late final AndroidEqualizer equalizer;
+  final AndroidEqualizer equalizer = AndroidEqualizer();
   late final AudioPlayer player;
 
   // ignore: deprecated_member_use
@@ -24,21 +25,22 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
   // Storage of stream subs
   StreamSubscription? _currentIndexSub;
   StreamSubscription? _playerStateSub;
+  StreamSubscription<AudioDevicesChangedEvent>? _devicesChangedSub;
   Timer? _resumeSaveTimer;
 
   AudioBloc() : super(const AudioState()) {
-    equalizer = AndroidEqualizer();
-    final pipeline = AudioPipeline(androidAudioEffects: [equalizer]);
-    player = AudioPlayer(audioPipeline: pipeline);
+    // Instantiate AudioPlayer without attaching AndroidEqualizer in AudioPipeline;
+    // enabling android.media.audiofx.Equalizer by default conflicts with Bluetooth
+    // A2DP/LE Audio offload and HAL routing on many Android devices, muting earbuds.
+    player = AudioPlayer();
 
-    // Default enable equalizer dynamically when ready
-    equalizer.setEnabled(true);
-
+    _initAudioSession();
     _loadResumeState();
 
     _resumeSaveTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       if (player.playing && state.currentTrack != null) {
-        DatabaseService.instance.saveResumeState(state.currentTrack!, player.position.inMilliseconds);
+        DatabaseService.instance.saveResumeState(
+            state.currentTrack!, player.position.inMilliseconds);
       }
     });
 
@@ -46,17 +48,22 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     on<AudioPause>((event, emit) {
       player.pause();
       if (state.currentTrack != null) {
-        DatabaseService.instance.saveResumeState(state.currentTrack!, player.position.inMilliseconds);
+        DatabaseService.instance.saveResumeState(
+            state.currentTrack!, player.position.inMilliseconds);
       }
     });
-    on<AudioResume>((event, emit) {
-      if (player.audioSource == null && state.currentTrack != null && state.queue.isEmpty) {
+    on<AudioResume>((event, emit) async {
+      if (player.audioSource == null &&
+          state.currentTrack != null &&
+          state.queue.isEmpty) {
         add(AudioPlayQueue([state.currentTrack!], startIndex: 0));
       } else {
-        player.play();
+        final session = await AudioSession.instance;
+        await session.setActive(true);
+        await player.play();
       }
     });
-    
+
     on<AudioSetResumeState>((event, emit) {
       emit(state.copyWith(
         currentTrack: event.track,
@@ -102,9 +109,31 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     });
   }
 
+  Future<void> _initAudioSession() async {
+    try {
+      final session = await AudioSession.instance;
+      if (!session.isConfigured) {
+        await session.configure(const AudioSessionConfiguration.music());
+      }
+      _devicesChangedSub =
+          session.devicesChangedEventStream.listen((event) async {
+        final hasAddedOutput = event.devicesAdded.any(
+          (device) => device.isOutput,
+        );
+        if (hasAddedOutput && !isClosed && player.playing) {
+          await session.setActive(true);
+        }
+      });
+    } catch (e) {
+      debugPrint("Error initializing AudioSession: $e");
+    }
+  }
+
   Future<void> _loadResumeState() async {
     final resumeState = await DatabaseService.instance.getResumeState();
-    if (resumeState != null && state.currentTrack == null && state.queue.isEmpty) {
+    if (resumeState != null &&
+        state.currentTrack == null &&
+        state.queue.isEmpty) {
       final track = resumeState['track'] as Map<String, String>;
       final positionMs = resumeState['positionMs'] as int;
       add(AudioSetResumeState(track, positionMs));
@@ -118,9 +147,11 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
   Future<void> close() {
     _currentIndexSub?.cancel();
     _playerStateSub?.cancel();
+    _devicesChangedSub?.cancel();
     _resumeSaveTimer?.cancel();
     if (state.currentTrack != null) {
-      DatabaseService.instance.saveResumeState(state.currentTrack!, player.position.inMilliseconds);
+      DatabaseService.instance
+          .saveResumeState(state.currentTrack!, player.position.inMilliseconds);
     }
     player.dispose();
     return super.close();
@@ -145,18 +176,20 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     AudioPlayQueue event,
     Emitter<AudioState> emit,
   ) async {
-    player.stop();
+    await player.stop();
     final queue = List<Map<String, String>>.from(event.tracks);
     final offset = event.startIndex;
     final currentTrack = queue[offset];
+    final resumeMs = (state.currentTrack?['videoId'] == currentTrack['videoId'])
+        ? state.resumePositionMs
+        : null;
 
     emit(
-      state
-          .copyWithNullified(dominantColor: true)
-          .copyWith(
+      state.copyWithNullified(dominantColor: true).copyWith(
             queue: queue,
             nativeIndexOffset: offset,
             currentTrack: currentTrack,
+            resumePositionMs: 0,
             isFetchingStream: true,
           ),
     );
@@ -166,19 +199,28 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       _updatePalette(currentTrack['artworkUrl']!);
     }
 
+    final firstSource = await _createAudioSource(currentTrack);
     // ignore: deprecated_member_use
-    _playlist = ConcatenatingAudioSource(children: []);
-    await player.setAudioSource(_playlist);
+    _playlist = ConcatenatingAudioSource(
+      children: firstSource != null ? [firstSource] : [],
+    );
 
-    final success = await _addTrackToPlaylist(offset, queue);
-    
+    if (firstSource != null) {
+      await player.setAudioSource(
+        _playlist,
+        initialPosition: (resumeMs != null && resumeMs > 0)
+            ? Duration(milliseconds: resumeMs)
+            : Duration.zero,
+      );
+    } else {
+      await player.setAudioSource(_playlist);
+    }
+
     emit(state.copyWith(isFetchingStream: false));
 
-    if (success) {
-      if (state.resumePositionMs != null && state.resumePositionMs! > 0) {
-        await player.seek(Duration(milliseconds: state.resumePositionMs!));
-        emit(state.copyWith(resumePositionMs: 0)); 
-      }
+    if (firstSource != null) {
+      final session = await AudioSession.instance;
+      await session.setActive(true);
       player.play();
       // Preload next tracks
       _preloadNext(offset + 1); // Trigger async preloading
@@ -276,7 +318,8 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       return;
     }
 
-    final newQueue = List<Map<String, String>>.from(state.queue)..add(event.track);
+    final newQueue = List<Map<String, String>>.from(state.queue)
+      ..add(event.track);
     emit(state.copyWith(queue: newQueue));
 
     // If preloading is near the end, ensure next track is queued
@@ -372,10 +415,13 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
 
     try {
       // Fetch Recommendations using the new multi-seed logic
-      final recommendedTracks = await RecommenderService.instance.getRecommendations([videoId]);
+      final recommendedTracks =
+          await RecommenderService.instance.getRecommendations([videoId]);
       if (recommendedTracks.isNotEmpty) {
-        final startIdx = (state.queue.length - 20) < 0 ? 0 : (state.queue.length - 20);
-        final recentVideoIds = state.queue.skip(startIdx).map((e) => e['videoId']).toSet();
+        final startIdx =
+            (state.queue.length - 20) < 0 ? 0 : (state.queue.length - 20);
+        final recentVideoIds =
+            state.queue.skip(startIdx).map((e) => e['videoId']).toSet();
         final newTracks = recommendedTracks
             .where((t) => !recentVideoIds.contains(t['videoId']))
             .toList();

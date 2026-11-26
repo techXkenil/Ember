@@ -2,7 +2,9 @@
 -keepclasseswithmembers class * { @androidx.annotation.Keep <fields>; }
 -keepclasseswithmembers class * { @androidx.annotation.Keep <methods>; }
 -keep class com.chaquo.python.** { *; }
--keep class com.example.ember_flutter.MainActivity { *; }
+-keep class com.ember.app.MainActivity { *; }
+-keep class androidx.media.** { *; }
+-dontwarn androidx.media.**
 -keep class io.flutter.** { *; }
 -dontwarn com.google.android.play.**
 -dontwarn io.flutter.embedding.engine.deferredcomponents.**
