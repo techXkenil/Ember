@@ -95,7 +95,7 @@ jobs:
         if: env.HAS_TOKEN == 'false'
         run: |
           cd ember_flutter
-          flutter build apk --release
+          flutter build apk --release --split-debug-info=build/app/outputs/symbols
 
       - name: Commit APK to repository
         if: env.IS_PATCH == 'false'

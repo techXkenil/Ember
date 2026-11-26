@@ -1,3 +1,8 @@
+import java.io.FileOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -31,7 +36,13 @@ android {
 
         ndk {
             abiFilters.clear()
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a")
+            abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
         }
     }
 
@@ -71,6 +82,7 @@ chaquopy {
         val candidatePaths = listOf(
             File(userHome, "AppData/Roaming/uv/python/cpython-3.11-windows-x86_64-none/python.exe"),
             File(userHome, "AppData/Roaming/uv/python/cpython-3.11.14-windows-x86_64-none/python.exe"),
+            File(userHome, "AppData/Local/Programs/Python/Python311/python.exe"),
             File("C:/Python311/python.exe"),
         )
         val pyExe = candidatePaths.firstOrNull { it.exists() }
@@ -89,6 +101,152 @@ chaquopy {
     sourceSets {
         getByName("main") {
             srcDir("../../../ember")
+            // Exclude desktop-only PyQt6 GUI/tray modules from the Android APK.
+            exclude(
+                "__main__.py",
+                "app.py",
+                "discord_rpc.py",
+                "doctor.py",
+                "exporter.py",
+                "icons.py",
+                "jobs.py",
+                "panel.py",
+                "player.py",
+                "scrobbler.py",
+                "settings_dialog.py",
+                "smtc.py",
+                "storage.py",
+                "theme.py",
+                "toast.py",
+                "tray.py",
+            )
+        }
+    }
+}
+
+fun pruneZipFile(zipFile: File, shouldDrop: (String) -> Boolean) {
+    if (!zipFile.exists()) return
+    val tmpFile = File(zipFile.parentFile, "${zipFile.name}.tmp")
+    ZipFile(zipFile).use { zin ->
+        ZipOutputStream(FileOutputStream(tmpFile)).use { zout ->
+            val entries = zin.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                if (shouldDrop(entry.name)) continue
+                val newEntry = ZipEntry(entry.name).apply {
+                    time = entry.time
+                }
+                zout.putNextEntry(newEntry)
+                zin.getInputStream(entry).use { input ->
+                    input.copyTo(zout)
+                }
+                zout.closeEntry()
+            }
+        }
+    }
+    if (!zipFile.delete() || !tmpFile.renameTo(zipFile)) {
+        tmpFile.copyTo(zipFile, overwrite = true)
+        tmpFile.delete()
+    }
+}
+
+afterEvaluate {
+    listOf("Debug", "Profile", "Release").forEach { variant ->
+        val variantLower = variant.lowercase()
+
+        tasks.findByName("install${variant}PythonRequirements")?.doLast {
+            val extDir = layout.buildDirectory
+                .dir("python/pip/$variantLower/common/yt_dlp/extractor")
+                .get()
+                .asFile
+            if (extDir.exists()) {
+                val keepFiles = setOf(
+                    "__init__.py", "__init__.pyc",
+                    "extractors.py", "extractors.pyc",
+                    "_extractors.py", "_extractors.pyc",
+                    "common.py", "common.pyc",
+                    "commonprotocols.py", "commonprotocols.pyc",
+                    "generic.py", "generic.pyc",
+                    "afreecatv.py", "afreecatv.pyc",
+                    "adobepass.py", "adobepass.pyc",
+                    "openload.py", "openload.pyc",
+                    "youtube",
+                )
+                extDir.listFiles()?.forEach { f ->
+                    if (f.name !in keepFiles) {
+                        f.deleteRecursively()
+                    }
+                }
+                val extractorsFile = File(extDir, "_extractors.py")
+                val extractorsPyc = File(extDir, "_extractors.pyc")
+                if (extractorsFile.exists()) {
+                    val originalLines = extractorsFile.readLines()
+                    val filteredLines = mutableListOf<String>()
+                    var inYoutubeBlock = false
+                    for (line in originalLines) {
+                        when {
+                            line.startsWith("from .generic import") -> filteredLines.add(line)
+                            line.startsWith("from .youtube import") -> {
+                                inYoutubeBlock = true
+                                filteredLines.add(line)
+                            }
+                            inYoutubeBlock -> {
+                                filteredLines.add(line)
+                                if (line.trim() == ")") inYoutubeBlock = false
+                            }
+                        }
+                    }
+                    extractorsFile.writeText(filteredLines.joinToString("\n") + "\n")
+                    if (extractorsPyc.exists()) {
+                        extractorsPyc.delete()
+                    }
+                    val envDir = layout.buildDirectory.dir("python/env/$variantLower").get().asFile
+                    val envPython = listOf(
+                        File(envDir, "Scripts/python.exe"),
+                        File(envDir, "bin/python"),
+                        File(envDir, "bin/python3"),
+                    ).firstOrNull { it.exists() }
+                    if (envPython != null) {
+                        val proc = ProcessBuilder(
+                            envPython.absolutePath,
+                            "-c",
+                            "import py_compile; py_compile.compile(r'${extractorsFile.absolutePath.replace("\\", "/")}', cfile=r'${extractorsPyc.absolutePath.replace("\\", "/")}', doraise=True)"
+                        ).redirectErrorStream(true).start()
+                        val output = proc.inputStream.bufferedReader().readText()
+                        if (proc.waitFor() != 0) {
+                            throw GradleException("Failed to compile pruned yt_dlp _extractors.py: $output")
+                        }
+                    }
+                }
+            }
+        }
+
+        tasks.findByName("generate${variant}PythonMiscAssets")?.doLast {
+            val stdlibImy = layout.buildDirectory
+                .file("python/assets/misc/$variantLower/chaquopy/stdlib-common.imy")
+                .get()
+                .asFile
+            val dropPrefixes = listOf(
+                "distutils/",
+                "lib2to3/",
+                "unittest/",
+                "pydoc.pyc",
+                "pydoc_data/",
+                "doctest.pyc",
+                "pdb.pyc",
+                "idlelib/",
+                "tkinter/",
+                "turtle.pyc",
+                "turtledemo/",
+                "ensurepip/",
+                "venv/",
+                "test/",
+                "xmlrpc/",
+                "mailbox.pyc",
+            )
+            pruneZipFile(stdlibImy) { name ->
+                dropPrefixes.any { prefix -> name == prefix || name.startsWith(prefix) }
+            }
         }
     }
 }
