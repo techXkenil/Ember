@@ -173,10 +173,16 @@ BASE_OPTIONS: Dict[str, Any] = {
     "extractor_retries": 0,
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "ios"],
-            "player_skip": ["webpage", "configs", "js"],
+            "player_client": ["android_sdkless"],
         }
     },
+}
+
+FALLBACK_EXTRACTOR_ARGS: Dict[str, Any] = {
+    "youtube": {
+        "player_client": ["android", "ios"],
+        "player_skip": ["webpage", "configs", "js"],
+    }
 }
 
 
@@ -204,12 +210,20 @@ class StreamResolver:
             self.options["format"] = FORMAT_STANDARD
         log.info("Stream resolver audio quality set to %s (%s)", mode, self.options["format"])
 
-    def _probe(self, target: str, max_attempts: int = 3) -> Dict[str, Any]:
+    def _probe(
+        self,
+        target: str,
+        max_attempts: int = 3,
+        options_override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Extract info from yt-dlp with retries and exponential backoff."""
+        opts = dict(self.options)
+        if options_override:
+            opts.update(options_override)
         last_exc: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
-                with yt_dlp.YoutubeDL(self.options) as ydl:
+                with yt_dlp.YoutubeDL(opts) as ydl:
                     data = ydl.extract_info(target, download=False)
                     if isinstance(data, dict):
                         return data
@@ -263,15 +277,31 @@ class StreamResolver:
             return cached, "", False
 
         target = WATCH_URL.format(video_id)
+        url: Optional[str] = None
+        last_err: str = ""
         try:
-            info = self._probe(target)
+            info = self._probe(target, max_attempts=2)
+            url = self._pick_url(info)
         except Exception as exc:
-            log.error("stream resolve failed for %s: %s", video_id, exc)
-            return None, str(exc), _is_permanent_failure(exc)
+            log.warning("primary stream resolve failed for %s: %s", video_id, exc)
+            if _is_permanent_failure(exc):
+                return None, str(exc), True
+            last_err = str(exc)
 
-        url = self._pick_url(info)
         if not url:
-            return None, "no playable audio stream was returned", False
+            try:
+                fallback_info = self._probe(
+                    target,
+                    max_attempts=2,
+                    options_override={"extractor_args": FALLBACK_EXTRACTOR_ARGS},
+                )
+                url = self._pick_url(fallback_info)
+            except Exception as exc:
+                log.error("stream resolve failed for %s: %s", video_id, exc)
+                return None, str(exc), _is_permanent_failure(exc)
+
+        if not url:
+            return None, last_err or "no playable audio stream was returned", False
         self.cache.put(video_id, url)
         return url, "", False
 

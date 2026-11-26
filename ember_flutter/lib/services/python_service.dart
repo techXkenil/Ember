@@ -74,6 +74,14 @@ class PythonService {
     await DatabaseService.instance.deleteCache('stream_url_$videoId');
   }
 
+  static Future<void> setPlaybackWakeLock(bool enabled) async {
+    try {
+      await _channel.invokeMethod('set_playback_wakelock', {
+        'enabled': enabled,
+      });
+    } catch (_) {}
+  }
+
   static Future<Result<Map<String, String?>>> getStreamUrl(
     String videoId, {
     bool forceRefresh = false,

@@ -23,14 +23,22 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
   bool _isPreloading = false;
   bool _isRecoveringError = false;
   bool _isHandlingCompletion = false;
+  bool _shouldBePlaying = false;
+  bool _wakeLockHeld = false;
+  int _queueGeneration = 0;
+  DateTime _lastPositionProgressAt = DateTime.now();
+  Duration _lastRecordedPosition = Duration.zero;
   final Map<String, int> _trackRetryCounts = {};
+  final Map<String, Duration> _lastKnownPositions = {};
 
   // Storage of stream subs
   StreamSubscription? _currentIndexSub;
   StreamSubscription? _playerStateSub;
+  StreamSubscription<Duration>? _positionSub;
   StreamSubscription<PlayerException>? _errorSub;
   StreamSubscription<AudioDevicesChangedEvent>? _devicesChangedSub;
   Timer? _resumeSaveTimer;
+  Timer? _stallWatchdogTimer;
 
   AudioBloc() : super(const AudioState()) {
     // Instantiate AudioPlayer without attaching AndroidEqualizer in AudioPipeline;
@@ -58,8 +66,14 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       }
     });
 
+    _stallWatchdogTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _checkPlaybackStall();
+    });
+
     on<AudioPlayQueue>(_onPlayQueue);
     on<AudioPause>((event, emit) {
+      _shouldBePlaying = false;
+      _syncWakeLock();
       player.pause();
       if (state.currentTrack != null) {
         DatabaseService.instance.saveResumeState(
@@ -67,10 +81,26 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       }
     });
     on<AudioResume>((event, emit) async {
+      _shouldBePlaying = true;
+      _lastPositionProgressAt = DateTime.now();
+      _syncWakeLock();
       if (player.audioSource == null &&
           state.currentTrack != null &&
           state.queue.isEmpty) {
         add(AudioPlayQueue([state.currentTrack!], startIndex: 0));
+      } else if (player.processingState == ProcessingState.idle &&
+          state.currentTrack != null) {
+        final videoId = state.currentTrack!['videoId'];
+        final idx = _currentQueueIndex();
+        if (idx >= 0 && idx < state.queue.length) {
+          add(
+            AudioPlayQueue(
+              state.queue,
+              startIndex: idx,
+              initialPosition: videoId != null ? _lastKnownPositions[videoId] : null,
+            ),
+          );
+        }
       } else {
         final session = await AudioSession.instance;
         await session.setActive(true);
@@ -85,20 +115,46 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       ));
     });
 
-    on<AudioStop>((event, emit) => player.stop());
+    on<AudioStop>((event, emit) {
+      _shouldBePlaying = false;
+      _syncWakeLock();
+      return player.stop();
+    });
     on<AudioClear>((event, emit) {
+      _shouldBePlaying = false;
+      _queueGeneration++;
+      _lastKnownPositions.clear();
+      _syncWakeLock();
       player.stop();
       emit(const AudioState());
     });
-    on<AudioSeekToNext>((event, emit) => player.seekToNext());
+    on<AudioSeekToNext>(_onSeekToNext);
     on<AudioSeekToPrevious>(_onSeekToPrevious);
     on<AudioJumpToQueueIndex>(_onJumpToQueueIndex);
 
     // Internal state updates from streams
     on<AudioPlayerStateChanged>((event, emit) {
+      final wasPlaying = state.playerState?.playing == true;
       emit(state.copyWith(playerState: event.playerState));
+      if (event.playerState.playing) {
+        _shouldBePlaying = true;
+      } else if (wasPlaying &&
+          event.playerState.processingState == ProcessingState.ready) {
+        // Genuine transition from playing -> paused (notification, earbuds, or audio focus).
+        _shouldBePlaying = false;
+      }
+      _syncWakeLock();
       if (event.playerState.processingState == ProcessingState.completed) {
         _handlePlaybackCompleted();
+      } else if (event.playerState.processingState == ProcessingState.idle &&
+          _shouldBePlaying &&
+          !state.isFetchingStream &&
+          !_isRecoveringError &&
+          !_isHandlingCompletion &&
+          player.audioSource != null &&
+          state.currentTrack != null) {
+        // Native player dropped to idle unexpectedly (e.g., lock-screen socket drop).
+        _recoverCurrentTrack(forceRefresh: true);
       }
     });
 
@@ -120,6 +176,17 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
 
     _playerStateSub = player.playerStateStream.listen((state) {
       add(AudioPlayerStateChanged(state));
+    });
+
+    _positionSub = player.positionStream.listen((position) {
+      if (position != _lastRecordedPosition) {
+        _lastRecordedPosition = position;
+        _lastPositionProgressAt = DateTime.now();
+      }
+      final videoId = state.currentTrack?['videoId'];
+      if (videoId != null && position > Duration.zero && player.playing) {
+        _lastKnownPositions[videoId] = position;
+      }
     });
 
     _errorSub = player.errorStream.listen(_onPlayerError);
@@ -163,15 +230,111 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
   Future<void> close() {
     _currentIndexSub?.cancel();
     _playerStateSub?.cancel();
+    _positionSub?.cancel();
     _errorSub?.cancel();
     _devicesChangedSub?.cancel();
     _resumeSaveTimer?.cancel();
+    _stallWatchdogTimer?.cancel();
+    _shouldBePlaying = false;
+    PythonService.setPlaybackWakeLock(false);
     if (state.currentTrack != null) {
       DatabaseService.instance
           .saveResumeState(state.currentTrack!, player.position.inMilliseconds);
     }
     player.dispose();
     return super.close();
+  }
+
+  void _syncWakeLock({bool forceFetching = false}) {
+    final processing = player.processingState;
+    final wantLock = forceFetching ||
+        _shouldBePlaying ||
+        state.isFetchingStream ||
+        player.playing ||
+        processing == ProcessingState.loading ||
+        processing == ProcessingState.buffering;
+    if (wantLock != _wakeLockHeld) {
+      _wakeLockHeld = wantLock;
+      PythonService.setPlaybackWakeLock(wantLock);
+    }
+  }
+
+  int _currentQueueIndex() {
+    final track = state.currentTrack;
+    if (track == null || state.queue.isEmpty) return -1;
+    if (player.audioSource != null && player.currentIndex != null) {
+      final candidate = state.nativeIndexOffset + player.currentIndex!;
+      if (candidate >= 0 &&
+          candidate < state.queue.length &&
+          state.queue[candidate]['videoId'] == track['videoId']) {
+        return candidate;
+      }
+    }
+    return state.queue.indexWhere((t) => t['videoId'] == track['videoId']);
+  }
+
+  void _checkPlaybackStall() {
+    if (isClosed ||
+        !_shouldBePlaying ||
+        state.isFetchingStream ||
+        _isRecoveringError ||
+        _isHandlingCompletion ||
+        state.currentTrack == null) {
+      return;
+    }
+
+    final proc = player.processingState;
+    if (proc == ProcessingState.idle && player.audioSource != null) {
+      _recoverCurrentTrack(forceRefresh: true);
+      return;
+    }
+
+    if ((proc == ProcessingState.buffering || proc == ProcessingState.loading) &&
+        DateTime.now().difference(_lastPositionProgressAt) >
+            const Duration(seconds: 18)) {
+      _recoverCurrentTrack(forceRefresh: true);
+    }
+  }
+
+  Future<void> _recoverCurrentTrack({bool forceRefresh = true}) async {
+    if (isClosed || _isRecoveringError || state.queue.isEmpty) return;
+    _isRecoveringError = true;
+    try {
+      final currQueueIndex = _currentQueueIndex();
+      if (currQueueIndex < 0 || currQueueIndex >= state.queue.length) return;
+      final track = state.queue[currQueueIndex];
+      final videoId = track['videoId'];
+      final savedPos =
+          videoId != null ? (_lastKnownPositions[videoId] ?? player.position) : player.position;
+
+      if (videoId != null && (_trackRetryCounts[videoId] ?? 0) < 3) {
+        final attempt = (_trackRetryCounts[videoId] ?? 0) + 1;
+        _trackRetryCounts[videoId] = attempt;
+        if (forceRefresh) {
+          await PythonService.invalidateStreamUrl(videoId);
+        }
+        await Future.delayed(Duration(milliseconds: 600 * attempt));
+        if (!isClosed && _shouldBePlaying) {
+          _lastPositionProgressAt = DateTime.now();
+          add(
+            AudioPlayQueue(
+              state.queue,
+              startIndex: currQueueIndex,
+              initialPosition:
+                  savedPos > const Duration(seconds: 2) ? savedPos : Duration.zero,
+              isRecovery: true,
+            ),
+          );
+          return;
+        }
+      }
+
+      if (currQueueIndex + 1 < state.queue.length && !isClosed && _shouldBePlaying) {
+        add(AudioPlayQueue(state.queue, startIndex: currQueueIndex + 1));
+      }
+    } finally {
+      _isRecoveringError = false;
+    }
   }
 
   Future<void> _updatePalette(String url) async {
@@ -193,14 +356,20 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     AudioPlayQueue event,
     Emitter<AudioState> emit,
   ) async {
-    await player.stop();
+    final gen = ++_queueGeneration;
     if (!event.isRecovery) {
       _trackRetryCounts.clear();
     }
+    _shouldBePlaying = true;
+    _lastPositionProgressAt = DateTime.now();
+    _syncWakeLock(forceFetching: true);
+
     final queue = List<Map<String, String>>.from(event.tracks);
     final offset = event.startIndex;
+    if (offset < 0 || offset >= queue.length) return;
     final currentTrack = queue[offset];
-    final resumeMs = (state.currentTrack?['videoId'] == currentTrack['videoId'])
+    final videoId = currentTrack['videoId'];
+    final resumeMs = (state.currentTrack?['videoId'] == videoId)
         ? state.resumePositionMs
         : null;
     final startPosition = event.initialPosition ??
@@ -223,34 +392,87 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       _updatePalette(currentTrack['artworkUrl']!);
     }
 
+    // Do NOT call player.stop() before resolving the stream URL: stopping
+    // transitions AudioService into ProcessingState.idle and triggers stopSelf(),
+    // which Android 12+ blocks from restarting once the phone screen is locked.
     final firstSource = await _createAudioSource(
       currentTrack,
       forceRefresh: event.isRecovery,
     );
-    // ignore: deprecated_member_use
-    _playlist = ConcatenatingAudioSource(
-      children: firstSource != null ? [firstSource] : [],
-    );
 
-    if (firstSource != null) {
-      await player.setAudioSource(
-        _playlist,
-        initialPosition: startPosition,
-      );
-    } else {
-      await player.setAudioSource(_playlist);
+    if (isClosed || gen != _queueGeneration) {
+      emit(state.copyWith(isFetchingStream: false));
+      return;
     }
 
-    emit(state.copyWith(isFetchingStream: false));
-
     if (firstSource != null) {
-      final session = await AudioSession.instance;
-      await session.setActive(true);
-      player.play();
-      // Preload next tracks
-      _preloadNext(offset + 1, queueOverride: queue);
-    } else if (offset + 1 < queue.length && !isClosed) {
+      // ignore: deprecated_member_use
+      final newPlaylist = ConcatenatingAudioSource(children: [firstSource]);
+      _playlist = newPlaylist;
+      try {
+        await player.setAudioSource(
+          newPlaylist,
+          initialPosition: startPosition,
+        );
+        emit(state.copyWith(isFetchingStream: false));
+        _lastPositionProgressAt = DateTime.now();
+        final session = await AudioSession.instance;
+        await session.setActive(true);
+        _syncWakeLock();
+        player.play();
+        // Preload next tracks safely for this queue generation
+        _preloadNext(offset + 1, queueOverride: queue, generation: gen);
+        return;
+      } catch (e) {
+        debugPrint("Error preparing/playing audio source for $videoId: $e");
+        emit(state.copyWith(isFetchingStream: false));
+        if (videoId != null && (_trackRetryCounts[videoId] ?? 0) < 3) {
+          final attempt = (_trackRetryCounts[videoId] ?? 0) + 1;
+          _trackRetryCounts[videoId] = attempt;
+          await PythonService.invalidateStreamUrl(videoId);
+          await Future.delayed(Duration(milliseconds: 700 * attempt));
+          if (!isClosed && gen == _queueGeneration && _shouldBePlaying) {
+            add(
+              AudioPlayQueue(
+                queue,
+                startIndex: offset,
+                initialPosition: startPosition,
+                isRecovery: true,
+              ),
+            );
+            return;
+          }
+        }
+      }
+    } else {
+      emit(state.copyWith(isFetchingStream: false));
+      if (videoId != null && (_trackRetryCounts[videoId] ?? 0) < 2) {
+        final attempt = (_trackRetryCounts[videoId] ?? 0) + 1;
+        _trackRetryCounts[videoId] = attempt;
+        await PythonService.invalidateStreamUrl(videoId);
+        await Future.delayed(Duration(milliseconds: 900 * attempt));
+        if (!isClosed && gen == _queueGeneration && _shouldBePlaying) {
+          add(
+            AudioPlayQueue(
+              queue,
+              startIndex: offset,
+              initialPosition: startPosition,
+              isRecovery: true,
+            ),
+          );
+          return;
+        }
+      }
+    }
+
+    if (offset + 1 < queue.length &&
+        !isClosed &&
+        gen == _queueGeneration &&
+        _shouldBePlaying) {
       add(AudioPlayQueue(queue, startIndex: offset + 1));
+    } else {
+      _shouldBePlaying = false;
+      _syncWakeLock();
     }
   }
 
@@ -280,18 +502,53 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     }
   }
 
+  Future<void> _onSeekToNext(
+    AudioSeekToNext event,
+    Emitter<AudioState> emit,
+  ) async {
+    _shouldBePlaying = true;
+    _lastPositionProgressAt = DateTime.now();
+    _syncWakeLock();
+    if (player.hasNext) {
+      await player.seekToNext();
+      if (!player.playing) {
+        final session = await AudioSession.instance;
+        await session.setActive(true);
+        player.play();
+      }
+      return;
+    }
+    final currNative = player.currentIndex ?? 0;
+    final nextQueueIndex = state.nativeIndexOffset + currNative + 1;
+    var activeQueue = state.queue;
+    if (nextQueueIndex >= activeQueue.length) {
+      activeQueue = await _checkAndLoadRadio(baseQueue: activeQueue);
+    }
+    if (nextQueueIndex < activeQueue.length && !isClosed) {
+      add(AudioPlayQueue(activeQueue, startIndex: nextQueueIndex));
+    }
+  }
+
   Future<void> _onSeekToPrevious(
     AudioSeekToPrevious event,
     Emitter<AudioState> emit,
   ) async {
+    _shouldBePlaying = true;
+    _lastPositionProgressAt = DateTime.now();
+    _syncWakeLock();
     if (player.hasPrevious) {
-      player.seekToPrevious();
-    } else {
-      if (state.nativeIndexOffset > 0) {
-        add(
-          AudioPlayQueue(state.queue, startIndex: state.nativeIndexOffset - 1),
-        );
+      await player.seekToPrevious();
+      if (!player.playing) {
+        final session = await AudioSession.instance;
+        await session.setActive(true);
+        player.play();
       }
+    } else if (state.nativeIndexOffset > 0) {
+      add(
+        AudioPlayQueue(state.queue, startIndex: state.nativeIndexOffset - 1),
+      );
+    } else if (player.position > const Duration(seconds: 2)) {
+      await player.seek(Duration.zero);
     }
   }
 
@@ -400,7 +657,7 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
   }
 
   Future<void> _onPlayerError(PlayerException error) async {
-    if (isClosed || _isRecoveringError) return;
+    if (isClosed || _isRecoveringError || state.isFetchingStream) return;
     _isRecoveringError = true;
     try {
       final currNative = error.index ?? player.currentIndex ?? 0;
@@ -409,15 +666,19 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
 
       final track = state.queue[currQueueIndex];
       final videoId = track['videoId'];
-      final resumePos = player.position;
+      final resumePos =
+          (videoId != null ? _lastKnownPositions[videoId] : null) ?? player.position;
       debugPrint(
         "Player error (${error.code}: ${error.message}) on $videoId at ${resumePos.inSeconds}s",
       );
 
-      if (videoId != null && (_trackRetryCounts[videoId] ?? 0) < 2) {
-        _trackRetryCounts[videoId] = (_trackRetryCounts[videoId] ?? 0) + 1;
+      if (videoId != null && (_trackRetryCounts[videoId] ?? 0) < 3) {
+        final attempt = (_trackRetryCounts[videoId] ?? 0) + 1;
+        _trackRetryCounts[videoId] = attempt;
         await PythonService.invalidateStreamUrl(videoId);
+        await Future.delayed(Duration(milliseconds: 700 * attempt));
         if (!isClosed) {
+          _lastPositionProgressAt = DateTime.now();
           add(
             AudioPlayQueue(
               state.queue,
@@ -443,6 +704,7 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
   Future<void> _handlePlaybackCompleted() async {
     if (isClosed || _isHandlingCompletion) return;
     _isHandlingCompletion = true;
+    final gen = _queueGeneration;
     try {
       final currNative = player.currentIndex ?? 0;
       final nextQueueIndex = state.nativeIndexOffset + currNative + 1;
@@ -452,7 +714,9 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
         activeQueue = await _checkAndLoadRadio(baseQueue: activeQueue);
       }
 
-      if (nextQueueIndex < activeQueue.length && !isClosed) {
+      if (isClosed || gen != _queueGeneration || !_shouldBePlaying) return;
+
+      if (nextQueueIndex < activeQueue.length) {
         if (nextQueueIndex < state.nativeIndexOffset + _playlist.length) {
           final targetNative = nextQueueIndex - state.nativeIndexOffset;
           await player.seek(Duration.zero, index: targetNative);
@@ -462,6 +726,9 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
         } else {
           add(AudioPlayQueue(activeQueue, startIndex: nextQueueIndex));
         }
+      } else {
+        _shouldBePlaying = false;
+        _syncWakeLock();
       }
     } finally {
       _isHandlingCompletion = false;
@@ -470,15 +737,29 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
 
   Future<bool> _addTrackToPlaylist(
     int index,
-    List<Map<String, String>> currentQueue,
-  ) async {
-    if (index >= currentQueue.length) return false;
+    List<Map<String, String>> currentQueue, {
+    required int generation,
+    // ignore: deprecated_member_use
+    required ConcatenatingAudioSource targetPlaylist,
+  }) async {
+    if (isClosed ||
+        generation != _queueGeneration ||
+        !identical(targetPlaylist, _playlist) ||
+        index >= currentQueue.length) {
+      return false;
+    }
 
     final track = currentQueue[index];
-    final audioSource = await _createAudioSource(track);
+    var audioSource = await _createAudioSource(track);
+    audioSource ??= await _createAudioSource(track, forceRefresh: true);
+    if (isClosed ||
+        generation != _queueGeneration ||
+        !identical(targetPlaylist, _playlist)) {
+      return false;
+    }
     if (audioSource != null) {
       // ignore: deprecated_member_use
-      await _playlist.add(audioSource);
+      await targetPlaylist.add(audioSource);
       return true;
     }
     return false;
@@ -487,8 +768,11 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
   Future<void> _preloadNext(
     int nextIndexBase, {
     List<Map<String, String>>? queueOverride,
+    int? generation,
   }) async {
-    if (_isPreloading || isClosed) return;
+    final gen = generation ?? _queueGeneration;
+    final targetPlaylist = _playlist;
+    if (_isPreloading || isClosed || gen != _queueGeneration) return;
     _isPreloading = true;
     try {
       var activeQueue = queueOverride ?? state.queue;
@@ -498,15 +782,28 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
         activeQueue = await _checkAndLoadRadio(baseQueue: activeQueue);
       }
 
+      if (isClosed ||
+          gen != _queueGeneration ||
+          !identical(targetPlaylist, _playlist)) {
+        return;
+      }
+
       // Keep up to 3 upcoming tracks queued in _playlist without breaking early
       // when _playlist already contains prefetched tracks ahead of nextIndexBase.
-      var nextToAppend = state.nativeIndexOffset + _playlist.length;
+      var nextToAppend = state.nativeIndexOffset + targetPlaylist.length;
       while (!isClosed &&
+          gen == _queueGeneration &&
+          identical(targetPlaylist, _playlist) &&
           nextToAppend < activeQueue.length &&
           nextToAppend < nextIndexBase + 3) {
-        final added = await _addTrackToPlaylist(nextToAppend, activeQueue);
+        final added = await _addTrackToPlaylist(
+          nextToAppend,
+          activeQueue,
+          generation: gen,
+          targetPlaylist: targetPlaylist,
+        );
         if (!added) break;
-        nextToAppend = state.nativeIndexOffset + _playlist.length;
+        nextToAppend = state.nativeIndexOffset + targetPlaylist.length;
       }
     } finally {
       _isPreloading = false;
