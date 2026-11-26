@@ -10,11 +10,18 @@ abstract class AudioEvent extends Equatable {
 class AudioPlayQueue extends AudioEvent {
   final List<Map<String, String>> tracks;
   final int startIndex;
+  final Duration? initialPosition;
+  final bool isRecovery;
 
-  const AudioPlayQueue(this.tracks, {this.startIndex = 0});
+  const AudioPlayQueue(
+    this.tracks, {
+    this.startIndex = 0,
+    this.initialPosition,
+    this.isRecovery = false,
+  });
 
   @override
-  List<Object?> get props => [tracks, startIndex];
+  List<Object?> get props => [tracks, startIndex, initialPosition, isRecovery];
 }
 
 class AudioPause extends AudioEvent {}
@@ -84,4 +91,3 @@ class AudioSetResumeState extends AudioEvent {
   @override
   List<Object?> get props => [track, positionMs];
 }
-

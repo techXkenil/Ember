@@ -70,29 +70,36 @@ class PythonService {
     }
   }
 
+  static Future<void> invalidateStreamUrl(String videoId) async {
+    await DatabaseService.instance.deleteCache('stream_url_$videoId');
+  }
+
   static Future<Result<Map<String, String?>>> getStreamUrl(
-    String videoId,
-  ) async {
+    String videoId, {
+    bool forceRefresh = false,
+  }) async {
     try {
       final db = DatabaseService.instance;
       final cacheKey = 'stream_url_$videoId';
-      
-      final cachedString = await db.getCache(cacheKey);
-      if (cachedString != null) {
-        try {
-           final decoded = jsonDecode(cachedString);
-           final timestamp = decoded['timestamp'] ?? 0;
-           // 5 hour expiration for streaming links (5 * 60 * 60 * 1000 = 18000000 ms)
-           if (DateTime.now().millisecondsSinceEpoch - timestamp < 18000000) {
-             final data = (decoded['data'] as Map).cast<String, String?>();
-             return Success(data);
-           }
-        } catch (_) {}
+
+      if (!forceRefresh) {
+        final cachedString = await db.getCache(cacheKey);
+        if (cachedString != null) {
+          try {
+            final decoded = jsonDecode(cachedString);
+            final timestamp = decoded['timestamp'] ?? 0;
+            // 45 minute expiration for signed streaming links (matches STREAM_CACHE_TTL_S)
+            if (DateTime.now().millisecondsSinceEpoch - timestamp < 2700000) {
+              final data = (decoded['data'] as Map).cast<String, String?>();
+              return Success(data);
+            }
+          } catch (_) {}
+        }
       }
 
       final Map<dynamic, dynamic> result = await _channel.invokeMethod(
         'get_stream_url',
-        {'videoId': videoId},
+        {'videoId': videoId, 'forceRefresh': forceRefresh},
       );
       final data = result.map(
         (key, value) => MapEntry(key.toString(), value?.toString()),
@@ -102,11 +109,13 @@ class PythonService {
           data['error']!.isNotEmpty) {
         return Failure(data['error'] ?? "Unknown python error");
       }
-      
-      await db.setCache(cacheKey, jsonEncode({
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
-        'data': data
-      }));
+
+      await db.setCache(
+          cacheKey,
+          jsonEncode({
+            'timestamp': DateTime.now().millisecondsSinceEpoch,
+            'data': data
+          }));
 
       return Success(data);
     } catch (e) {
@@ -215,18 +224,19 @@ class PythonService {
     String historyJson,
   ) async {
     try {
-      final String result = await _channel.invokeMethod('build_affinity_graph', {
+      final String result =
+          await _channel.invokeMethod('build_affinity_graph', {
         'history_json': historyJson,
       });
       final decoded = jsonDecode(result) as Map<String, dynamic>;
       final Map<String, Map<String, double>> graph = {};
       decoded.forEach((key, value) {
         if (value is Map) {
-           final Map<String, double> edges = {};
-           value.forEach((k2, v2) {
-             edges[k2.toString()] = (v2 as num).toDouble();
-           });
-           graph[key] = edges;
+          final Map<String, double> edges = {};
+          value.forEach((k2, v2) {
+            edges[k2.toString()] = (v2 as num).toDouble();
+          });
+          graph[key] = edges;
         }
       });
       return Success(graph);

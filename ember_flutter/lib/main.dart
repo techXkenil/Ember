@@ -1,6 +1,8 @@
+import 'dart:io';
 import 'dart:ui';
 
 import 'package:audio_session/audio_session.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:ember_flutter/blocs/audio/audio_bloc.dart';
 import 'package:ember_flutter/blocs/audio/audio_state.dart';
 import 'package:ember_flutter/blocs/storage/storage_bloc.dart';
@@ -30,8 +32,8 @@ void main() async {
   await JustAudioBackground.init(
     androidNotificationChannelId: 'com.example.ember.channel.audio',
     androidNotificationChannelName: 'Ember Music',
-    androidNotificationOngoing: true,
-    androidStopForegroundOnPause: true,
+    androidNotificationOngoing: false,
+    androidStopForegroundOnPause: false,
     androidShowNotificationBadge: true,
     androidNotificationIcon: 'drawable/ic_music_notification',
   );
@@ -125,6 +127,13 @@ class _MainLayoutState extends State<MainLayout> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       UpdateChecker.checkForUpdate(context);
+      if (Platform.isAndroid) {
+        Permission.notification.status.then((status) {
+          if (status.isDenied) {
+            Permission.notification.request();
+          }
+        });
+      }
     });
 
     UpdateService.instance.onUpdateReady.listen((ready) {

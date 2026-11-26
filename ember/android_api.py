@@ -100,13 +100,16 @@ def top_artists() -> List[Dict[str, str]]:
         return []
 
 
-def get_stream_url(video_id: str) -> Dict[str, str]:
+def get_stream_url(video_id: str, force_refresh: bool = False) -> Dict[str, str]:
     """Resolve direct audio streaming URL using yt-dlp."""
     if not video_id or not video_id.strip():
         return {"url": "", "format": "", "error": "Empty videoId"}
     try:
+        clean_id = video_id.strip()
         resolver = _get_stream_resolver()
-        url, err, _ = resolver.resolve(video_id.strip())
+        if force_refresh:
+            resolver.cache.invalidate(clean_id)
+        url, err, _ = resolver.resolve(clean_id)
         if url:
             return {"url": url, "format": "audio/mp4", "error": ""}
         return {"url": "", "format": "", "error": err or "Failed to resolve stream"}

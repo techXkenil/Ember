@@ -102,12 +102,15 @@ class DatabaseService {
     final videoId = track['videoId'];
     if (videoId == null) return;
 
-    await db.insert('downloads', {
-      'videoId': videoId,
-      'filePath': filePath,
-      'trackData': jsonEncode(track),
-      'timestamp': DateTime.now().millisecondsSinceEpoch,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert(
+        'downloads',
+        {
+          'videoId': videoId,
+          'filePath': filePath,
+          'trackData': jsonEncode(track),
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<void> removeDownload(String videoId) async {
@@ -149,10 +152,13 @@ class DatabaseService {
   // --- Search History ---
   Future<void> addSearch(String query) async {
     final db = await instance.database;
-    await db.insert('search_history', {
-      'query': query,
-      'timestamp': DateTime.now().millisecondsSinceEpoch,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert(
+        'search_history',
+        {
+          'query': query,
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<void> removeSearch(String query) async {
@@ -181,15 +187,17 @@ class DatabaseService {
     final videoId = track['videoId'];
     if (videoId == null) return;
 
-    await db.insert('play_history', {
-      'videoId': videoId,
-      'trackData': jsonEncode(track),
-      'timestamp': DateTime.now().millisecondsSinceEpoch,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert(
+        'play_history',
+        {
+          'videoId': videoId,
+          'trackData': jsonEncode(track),
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
 
     // Limits
-    final count =
-        Sqflite.firstIntValue(
+    final count = Sqflite.firstIntValue(
           await db.rawQuery('SELECT COUNT(*) FROM play_history'),
         ) ??
         0;
@@ -327,11 +335,14 @@ class DatabaseService {
   // --- Cache (For Home Feed, etc) ---
   Future<void> setCache(String key, String data) async {
     final db = await instance.database;
-    await db.insert('cache', {
-      'key': key,
-      'data': data,
-      'timestamp': DateTime.now().millisecondsSinceEpoch,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert(
+        'cache',
+        {
+          'key': key,
+          'data': data,
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<String?> getCache(String key) async {
@@ -343,26 +354,37 @@ class DatabaseService {
     return null;
   }
 
+  Future<void> deleteCache(String key) async {
+    final db = await instance.database;
+    await db.delete('cache', where: 'key = ?', whereArgs: [key]);
+  }
+
   // --- Resume State ---
-  Future<void> saveResumeState(Map<String, String> track, int positionMs) async {
+  Future<void> saveResumeState(
+      Map<String, String> track, int positionMs) async {
     final db = await instance.database;
     final data = {
       'track': track,
       'positionMs': positionMs,
     };
-    await db.insert('cache', {
-      'key': 'resume_state',
-      'data': jsonEncode(data),
-      'timestamp': DateTime.now().millisecondsSinceEpoch,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert(
+        'cache',
+        {
+          'key': 'resume_state',
+          'data': jsonEncode(data),
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<Map<String, dynamic>?> getResumeState() async {
     final db = await instance.database;
-    final res = await db.query('cache', where: 'key = ?', whereArgs: ['resume_state']);
+    final res =
+        await db.query('cache', where: 'key = ?', whereArgs: ['resume_state']);
     if (res.isNotEmpty) {
       try {
-        final decoded = jsonDecode(res.first['data'] as String) as Map<String, dynamic>;
+        final decoded =
+            jsonDecode(res.first['data'] as String) as Map<String, dynamic>;
         return {
           'track': Map<String, String>.from(decoded['track']),
           'positionMs': decoded['positionMs'] as int,

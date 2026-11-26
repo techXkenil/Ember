@@ -21,10 +21,14 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
   // ignore: deprecated_member_use
   ConcatenatingAudioSource _playlist = ConcatenatingAudioSource(children: []);
   bool _isPreloading = false;
+  bool _isRecoveringError = false;
+  bool _isHandlingCompletion = false;
+  final Map<String, int> _trackRetryCounts = {};
 
   // Storage of stream subs
   StreamSubscription? _currentIndexSub;
   StreamSubscription? _playerStateSub;
+  StreamSubscription<PlayerException>? _errorSub;
   StreamSubscription<AudioDevicesChangedEvent>? _devicesChangedSub;
   Timer? _resumeSaveTimer;
 
@@ -32,7 +36,17 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     // Instantiate AudioPlayer without attaching AndroidEqualizer in AudioPipeline;
     // enabling android.media.audiofx.Equalizer by default conflicts with Bluetooth
     // A2DP/LE Audio offload and HAL routing on many Android devices, muting earbuds.
-    player = AudioPlayer();
+    // Configure generous Android buffering so lock-screen network dips don't stall playback.
+    player = AudioPlayer(
+      audioLoadConfiguration: const AudioLoadConfiguration(
+        androidLoadControl: AndroidLoadControl(
+          minBufferDuration: Duration(seconds: 30),
+          maxBufferDuration: Duration(seconds: 120),
+          bufferForPlaybackDuration: Duration(milliseconds: 2500),
+          bufferForPlaybackAfterRebufferDuration: Duration(seconds: 5),
+        ),
+      ),
+    );
 
     _initAudioSession();
     _loadResumeState();
@@ -84,7 +98,7 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     on<AudioPlayerStateChanged>((event, emit) {
       emit(state.copyWith(playerState: event.playerState));
       if (event.playerState.processingState == ProcessingState.completed) {
-        _checkAndLoadRadio();
+        _handlePlaybackCompleted();
       }
     });
 
@@ -107,6 +121,8 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     _playerStateSub = player.playerStateStream.listen((state) {
       add(AudioPlayerStateChanged(state));
     });
+
+    _errorSub = player.errorStream.listen(_onPlayerError);
   }
 
   Future<void> _initAudioSession() async {
@@ -147,6 +163,7 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
   Future<void> close() {
     _currentIndexSub?.cancel();
     _playerStateSub?.cancel();
+    _errorSub?.cancel();
     _devicesChangedSub?.cancel();
     _resumeSaveTimer?.cancel();
     if (state.currentTrack != null) {
@@ -177,12 +194,19 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     Emitter<AudioState> emit,
   ) async {
     await player.stop();
+    if (!event.isRecovery) {
+      _trackRetryCounts.clear();
+    }
     final queue = List<Map<String, String>>.from(event.tracks);
     final offset = event.startIndex;
     final currentTrack = queue[offset];
     final resumeMs = (state.currentTrack?['videoId'] == currentTrack['videoId'])
         ? state.resumePositionMs
         : null;
+    final startPosition = event.initialPosition ??
+        ((resumeMs != null && resumeMs > 0)
+            ? Duration(milliseconds: resumeMs)
+            : Duration.zero);
 
     emit(
       state.copyWithNullified(dominantColor: true).copyWith(
@@ -199,7 +223,10 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       _updatePalette(currentTrack['artworkUrl']!);
     }
 
-    final firstSource = await _createAudioSource(currentTrack);
+    final firstSource = await _createAudioSource(
+      currentTrack,
+      forceRefresh: event.isRecovery,
+    );
     // ignore: deprecated_member_use
     _playlist = ConcatenatingAudioSource(
       children: firstSource != null ? [firstSource] : [],
@@ -208,9 +235,7 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     if (firstSource != null) {
       await player.setAudioSource(
         _playlist,
-        initialPosition: (resumeMs != null && resumeMs > 0)
-            ? Duration(milliseconds: resumeMs)
-            : Duration.zero,
+        initialPosition: startPosition,
       );
     } else {
       await player.setAudioSource(_playlist);
@@ -223,7 +248,9 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       await session.setActive(true);
       player.play();
       // Preload next tracks
-      _preloadNext(offset + 1); // Trigger async preloading
+      _preloadNext(offset + 1, queueOverride: queue);
+    } else if (offset + 1 < queue.length && !isClosed) {
+      add(AudioPlayQueue(queue, startIndex: offset + 1));
     }
   }
 
@@ -326,7 +353,10 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     _preloadNext(state.nativeIndexOffset + _playlist.length);
   }
 
-  Future<AudioSource?> _createAudioSource(Map<String, String> track) async {
+  Future<AudioSource?> _createAudioSource(
+    Map<String, String> track, {
+    bool forceRefresh = false,
+  }) async {
     final videoId = track['videoId'];
     if (videoId == null) return null;
 
@@ -338,7 +368,10 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
       if (dbDownload != null) {
         audioUrl = 'file://${dbDownload['filePath']}';
       } else {
-        final infoResult = await PythonService.getStreamUrl(videoId);
+        final infoResult = await PythonService.getStreamUrl(
+          videoId,
+          forceRefresh: forceRefresh,
+        );
         if (infoResult is Success<Map<String, String?>>) {
           audioUrl = infoResult.data['url'];
         }
@@ -366,6 +399,75 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     return null;
   }
 
+  Future<void> _onPlayerError(PlayerException error) async {
+    if (isClosed || _isRecoveringError) return;
+    _isRecoveringError = true;
+    try {
+      final currNative = error.index ?? player.currentIndex ?? 0;
+      final currQueueIndex = state.nativeIndexOffset + currNative;
+      if (currQueueIndex < 0 || currQueueIndex >= state.queue.length) return;
+
+      final track = state.queue[currQueueIndex];
+      final videoId = track['videoId'];
+      final resumePos = player.position;
+      debugPrint(
+        "Player error (${error.code}: ${error.message}) on $videoId at ${resumePos.inSeconds}s",
+      );
+
+      if (videoId != null && (_trackRetryCounts[videoId] ?? 0) < 2) {
+        _trackRetryCounts[videoId] = (_trackRetryCounts[videoId] ?? 0) + 1;
+        await PythonService.invalidateStreamUrl(videoId);
+        if (!isClosed) {
+          add(
+            AudioPlayQueue(
+              state.queue,
+              startIndex: currQueueIndex,
+              initialPosition: resumePos > const Duration(seconds: 2)
+                  ? resumePos
+                  : Duration.zero,
+              isRecovery: true,
+            ),
+          );
+          return;
+        }
+      }
+
+      if (currQueueIndex + 1 < state.queue.length && !isClosed) {
+        add(AudioPlayQueue(state.queue, startIndex: currQueueIndex + 1));
+      }
+    } finally {
+      _isRecoveringError = false;
+    }
+  }
+
+  Future<void> _handlePlaybackCompleted() async {
+    if (isClosed || _isHandlingCompletion) return;
+    _isHandlingCompletion = true;
+    try {
+      final currNative = player.currentIndex ?? 0;
+      final nextQueueIndex = state.nativeIndexOffset + currNative + 1;
+      var activeQueue = state.queue;
+
+      if (nextQueueIndex >= activeQueue.length) {
+        activeQueue = await _checkAndLoadRadio(baseQueue: activeQueue);
+      }
+
+      if (nextQueueIndex < activeQueue.length && !isClosed) {
+        if (nextQueueIndex < state.nativeIndexOffset + _playlist.length) {
+          final targetNative = nextQueueIndex - state.nativeIndexOffset;
+          await player.seek(Duration.zero, index: targetNative);
+          final session = await AudioSession.instance;
+          await session.setActive(true);
+          player.play();
+        } else {
+          add(AudioPlayQueue(activeQueue, startIndex: nextQueueIndex));
+        }
+      }
+    } finally {
+      _isHandlingCompletion = false;
+    }
+  }
+
   Future<bool> _addTrackToPlaylist(
     int index,
     List<Map<String, String>> currentQueue,
@@ -382,36 +484,44 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
     return false;
   }
 
-  Future<void> _preloadNext(int nextIndexBase) async {
-    if (_isPreloading) return;
+  Future<void> _preloadNext(
+    int nextIndexBase, {
+    List<Map<String, String>>? queueOverride,
+  }) async {
+    if (_isPreloading || isClosed) return;
     _isPreloading = true;
+    try {
+      var activeQueue = queueOverride ?? state.queue;
 
-    // Check if we reached the end of the explicit queue dynamically.
-    if (nextIndexBase >= state.queue.length) {
-      await _checkAndLoadRadio();
-    }
-
-    // Aggressive multi-track prefetching (up to 3 tracks ahead)
-    for (int i = 0; i < 3; i++) {
-      if (isClosed) break;
-      final targetIndex = nextIndexBase + i;
-      if (targetIndex < state.queue.length &&
-          targetIndex == (state.nativeIndexOffset + _playlist.length)) {
-        await _addTrackToPlaylist(targetIndex, state.queue);
-      } else {
-        break;
+      // Check if we are nearing the end of the explicit queue dynamically.
+      if (nextIndexBase + 2 >= activeQueue.length) {
+        activeQueue = await _checkAndLoadRadio(baseQueue: activeQueue);
       }
-    }
 
-    _isPreloading = false;
+      // Keep up to 3 upcoming tracks queued in _playlist without breaking early
+      // when _playlist already contains prefetched tracks ahead of nextIndexBase.
+      var nextToAppend = state.nativeIndexOffset + _playlist.length;
+      while (!isClosed &&
+          nextToAppend < activeQueue.length &&
+          nextToAppend < nextIndexBase + 3) {
+        final added = await _addTrackToPlaylist(nextToAppend, activeQueue);
+        if (!added) break;
+        nextToAppend = state.nativeIndexOffset + _playlist.length;
+      }
+    } finally {
+      _isPreloading = false;
+    }
   }
 
-  Future<void> _checkAndLoadRadio() async {
-    if (state.queue.isEmpty) return;
+  Future<List<Map<String, String>>> _checkAndLoadRadio({
+    List<Map<String, String>>? baseQueue,
+  }) async {
+    final activeQueue = baseQueue ?? state.queue;
+    if (activeQueue.isEmpty) return activeQueue;
 
-    final lastTrack = state.queue.last;
+    final lastTrack = activeQueue.last;
     final videoId = lastTrack['videoId'];
-    if (videoId == null) return;
+    if (videoId == null) return activeQueue;
 
     try {
       // Fetch Recommendations using the new multi-seed logic
@@ -419,24 +529,26 @@ class AudioBloc extends Bloc<AudioEvent, AudioState> {
           await RecommenderService.instance.getRecommendations([videoId]);
       if (recommendedTracks.isNotEmpty) {
         final startIdx =
-            (state.queue.length - 20) < 0 ? 0 : (state.queue.length - 20);
+            (activeQueue.length - 20) < 0 ? 0 : (activeQueue.length - 20);
         final recentVideoIds =
-            state.queue.skip(startIdx).map((e) => e['videoId']).toSet();
+            activeQueue.skip(startIdx).map((e) => e['videoId']).toSet();
         final newTracks = recommendedTracks
             .where((t) => !recentVideoIds.contains(t['videoId']))
             .toList();
 
         if (newTracks.isNotEmpty) {
-          final updatedQueue = List<Map<String, String>>.from(state.queue)
+          final updatedQueue = List<Map<String, String>>.from(activeQueue)
             ..addAll(newTracks.take(10)); // Add next 10 recommended tracks
           if (!isClosed) {
             _internalEmitQueueUpdate(updatedQueue);
           }
+          return updatedQueue;
         }
       }
     } catch (e) {
       debugPrint("Autoplay fetch error: $e");
     }
+    return activeQueue;
   }
 
   // A helper method if we need to emit explicitly from inside an async background op safely.

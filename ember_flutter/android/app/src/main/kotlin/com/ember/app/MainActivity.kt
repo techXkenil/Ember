@@ -60,9 +60,10 @@ class MainActivity: FlutterActivity() {
                 }
                 "get_stream_url" -> {
                     val videoId = call.argument<String>("videoId")
+                    val forceRefresh = call.argument<Boolean>("forceRefresh") ?: false
                     executor.execute {
                         try {
-                            val res = module.callAttr("get_stream_url", videoId).asMap()
+                            val res = module.callAttr("get_stream_url", videoId, forceRefresh).asMap()
                             val kotlinMap = res.mapKeys { it.key.toString() }.mapValues { it.value?.toString() }
                             runOnUiThread { result.success(kotlinMap) }
                         } catch (e: Exception) {
